@@ -5,13 +5,24 @@ For more details about this component, please refer to the documentation at
 https://home-assistant.io/components/wink/
 """
 import logging
+import json
 
-from homeassistant.const import CONF_ACCESS_TOKEN, ATTR_BATTERY_LEVEL
 from homeassistant.helpers import validate_config, discovery
-from homeassistant.helpers.entity import ToggleEntity
+from homeassistant.const import CONF_ACCESS_TOKEN, ATTR_BATTERY_LEVEL
+from homeassistant.helpers.entity import Entity
 
 DOMAIN = "wink"
-REQUIREMENTS = ['python-wink==0.7.7']
+REQUIREMENTS = ['python-wink==0.7.8', 'pubnub==3.7.8']
+
+DISCOVER_LIGHTS = "wink.lights"
+DISCOVER_SWITCHES = "wink.switches"
+DISCOVER_SENSORS = "wink.sensors"
+DISCOVER_BINARY_SENSORS = "wink.binary_sensors"
+DISCOVER_LOCKS = "wink.locks"
+DISCOVER_GARAGE_DOORS = "wink.garage_doors"
+
+SUBSCRIPTION_HANDLER = None
+CHANNELS = []
 
 
 def setup(hass, config):
@@ -22,7 +33,11 @@ def setup(hass, config):
         return False
 
     import pywink
+    from pubnub import Pubnub
     pywink.set_bearer_token(config[DOMAIN][CONF_ACCESS_TOKEN])
+    sub_key = pywink.get_subscription_key()
+    global SUBSCRIPTION_HANDLER
+    SUBSCRIPTION_HANDLER = Pubnub(subscribe_key=sub_key, publish_key="N/A")
 
     # Load components for the devices in the Wink that we support
     for component_name, func_exists in (
@@ -41,13 +56,39 @@ def setup(hass, config):
     return True
 
 
-class WinkToggleDevice(ToggleEntity):
-    """Represents a Wink toggle (switch) device."""
+class WinkDevice(Entity):
+    """Represents a base Wink device."""
 
     def __init__(self, wink):
         """Initialize the Wink device."""
+        from pubnub import Pubnub
         self.wink = wink
         self._battery = self.wink.battery_level
+        if (SUBSCRIPTION_HANDLER is not None and
+                self.wink.pubnub_channel is not None):
+            self.sub_key = self.wink.pubnub_key
+            self.sub_channel = self.wink.pubnub_channel
+            if self.sub_channel in CHANNELS:
+                pubnub = Pubnub(subscribe_key=self.sub_key, publish_key="N/A")
+                pubnub.subscribe(channels=self.sub_channel,
+                                 callback=self._pubnub_update,
+                                 error=self._pubnub_error)
+            else:
+                CHANNELS.append(self.sub_channel)
+                SUBSCRIPTION_HANDLER.subscribe(channels=self.sub_channel,
+                                               callback=self._pubnub_update,
+                                               error=self._pubnub_error)
+        else:
+            self.sub_key = None
+            self.sub_channel = None
+
+    def _pubnub_update(self, message, channel):
+        self.wink.pubnub_update(json.loads(message))
+        self.update_ha_state(True)
+
+    def _pubnub_error(self, message):
+        logging.getLogger(__name__).error(
+            "Error on pubnub update for " + self.wink.name())
 
     @property
     def unique_id(self):
@@ -60,26 +101,14 @@ class WinkToggleDevice(ToggleEntity):
         return self.wink.name()
 
     @property
-    def is_on(self):
-        """Return true if device is on."""
-        return self.wink.state()
-
-    @property
     def available(self):
         """True if connection == True."""
         return self.wink.available
 
-    def turn_on(self, **kwargs):
-        """Turn the device on."""
-        self.wink.set_state(True)
-
-    def turn_off(self):
-        """Turn the device off."""
-        self.wink.set_state(False)
-
     def update(self):
         """Update state of the device."""
-        self.wink.update_state()
+        if self.sub_key is None and self.sub_channel is None:
+            self.wink.update_state()
 
     @property
     def device_state_attributes(self):
